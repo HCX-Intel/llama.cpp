@@ -16,6 +16,7 @@ class ZayaModel(TextModel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._normalise_hparams()
         self._experts: dict[int, dict[str, Tensor]] | None = {}
         self._tokenizer_vocab_size: int | None = None
         try:
@@ -23,6 +24,68 @@ class ZayaModel(TextModel):
             self._tokenizer_vocab_size = LlamaHfVocab(self.dir_model).vocab_size
         except Exception:
             pass
+
+    def _normalise_hparams(self) -> None:
+        """Reconcile Zyphra/ZAYA1-base's config.json with the checkpoint.
+
+        That config describes the stack with per-layer lists where the converter
+        expects scalars, and two of its scalars disagree with the weights that
+        ship beside it:
+
+          num_hidden_layers  120  ->  80   (layers are 0..79; 40 attention at
+                                            even indices, 40 MoE at odd)
+          num_attention_heads 16  ->   8   (linear_q is [1024, 2048] = 8 x 128,
+                                            and conv_qk.0 is [1280, ...] =
+                                            (8 + 2) x 128)
+
+        Left alone, neither raises. num_hidden_layers=120 writes a block count
+        the loader believes, so it then demands blk.80..119 and dies on a
+        missing tensor; num_attention_heads=16 sizes the CCA projections at
+        2304 instead of 1280 and mismatches every q/conv tensor. Both are
+        recoverable only because the checkpoint states the truth in its shapes,
+        which is what the values below are taken from -- not from the config,
+        and not from inference about what Zyphra meant.
+
+        num_experts, ffn_hidden_size and zaya_mlp_expansion are absent as
+        scalars but unambiguous in the lists, so they are read across.
+        """
+        hp = self.hparams
+
+        layers = hp.get("zaya_layers")
+        if isinstance(layers, list) and layers:
+            if self.block_count != len(layers):
+                logger.warning(
+                    "config num_hidden_layers=%s disagrees with the checkpoint "
+                    "(%d layers); using %d",
+                    hp.get("num_hidden_layers"), len(layers), len(layers),
+                )
+            self.block_count = len(layers)
+            self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+            # zaya_layers is ['a', 16, 'a', 16, ...] -- 'a' marks an attention
+            # layer, the integer is the expert count of an MoE layer.
+            experts = {x for x in layers if isinstance(x, int) and not isinstance(x, bool)}
+            if len(experts) == 1:
+                hp.setdefault("num_experts", experts.pop())
+
+        # This config calls the head dimension kv_channels. The base converter
+        # only emits key_length/value_length when it finds "head_dim", so
+        # without this the GGUF carries neither and llama.cpp falls back to
+        # n_embd / n_head = 2048 / 8 = 256. It then sizes wq at n_head *
+        # n_embd_head_k = 2048 and rejects the real [2048, 1024] tensor. The
+        # fallback is silent and wrong by exactly a factor of two.
+        if "head_dim" not in hp and hp.get("kv_channels"):
+            hp["head_dim"] = hp["kv_channels"]
+
+        # Per-layer lists carrying one non-zero value: 0 marks the layers of the
+        # other kind. Collapse only when that value is unambiguous.
+        for dst, src in (("ffn_hidden_size", "ffn_hidden_size_list"),
+                         ("zaya_mlp_expansion", "zaya_mlp_expansion"),
+                         ("num_attention_heads", "cca_num_q_heads")):
+            values = hp.get(src)
+            if isinstance(values, list):
+                non_zero = {x for x in values if x}
+                if len(non_zero) == 1:
+                    hp[dst] = non_zero.pop()
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
