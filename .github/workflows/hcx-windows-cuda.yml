@@ -1,0 +1,198 @@
+name: HCX Windows CUDA build
+
+# Builds a complete Windows x64 CUDA package of this fork: llama-server.exe and
+# every tool beside it, the ggml backend DLLs, the MSVC runtime, and the CUDA
+# runtime DLLs in a second zip. Same shape as an upstream release, so the node
+# extracts it exactly as docs/WINDOWS-MEASUREMENT.md describes for b10659.
+#
+# Why this exists: upstream closed PR #23112 (ZAYA1 support) unmerged on
+# 5 September 2026, so no upstream release will ever carry the zaya
+# architecture. HCX builds its own, here, on a GitHub-hosted runner, so that
+# the measurement node never needs a compiler or a CUDA toolkit installed.
+#
+# Derived from upstream's release.yml (windows-cuda job) and
+# build-cuda-windows.yml, folded into one self-contained job. Upstream splits
+# the CPU-side binaries and the CUDA DLL across two jobs and merges the zips at
+# release time; here one MSVC build produces everything, which is simpler and
+# records one compiler rather than two.
+
+on:
+  push:
+    branches: ['hcx/**']
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      cuda_archs:
+        description: >-
+          CMAKE_CUDA_ARCHITECTURES. 86 = RTX 3060 (Ampere GA106), the only card
+          the test bed has. Empty = ggml's default multi-arch set (much slower).
+        default: '86'
+        type: string
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  CUDA_ARCHS: ${{ github.event.inputs.cuda_archs || '86' }}
+
+concurrency:
+  group: hcx-windows-cuda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-cuda:
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    permissions:
+      actions: write   # ccache-clear prunes stale cache entries
+
+    strategy:
+      matrix:
+        cuda: ['13.3']
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # build number and commit in --version come from git
+
+      # Only used if the prebuilt server web UI is not available for this
+      # commit and CMake falls back to building it.
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install CUDA Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: hcx-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      - name: Build
+        shell: cmd
+        # GGML_CUDA_CUB_3DOT2: same flag upstream passes for CTK 13.3.
+        # Tests and examples are off: they are not shipped and cost build time.
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set ARCH_FLAG=
+          if not "%CUDA_ARCHS%"=="" set ARCH_FLAG=-DCMAKE_CUDA_ARCHITECTURES=%CUDA_ARCHS%
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            %ARCH_FLAG%
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% -t ggml
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: hcx-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      # A build that quietly came out without the CUDA backend still runs,
+      # still serves, and reports a plausible CPU number. Fail here instead.
+      - name: Verify the build carries everything the node needs
+        shell: pwsh
+        run: |
+          $bin = ".\build\bin\Release"
+          $required = @(
+            "ggml-cuda.dll", "ggml-base.dll", "ggml.dll", "llama.dll",
+            "llama-server.exe", "llama-cli.exe",
+            "llama-quantize.exe", "llama-imatrix.exe",
+            "llama-bench.exe", "llama-batched-bench.exe"
+          )
+          $missing = $required | Where-Object { -not (Test-Path "$bin\$_") }
+          if ($missing) { Write-Error "missing from build: $($missing -join ', ')"; exit 1 }
+          Get-ChildItem $bin | Sort-Object Name | Format-Table Name, Length -AutoSize
+          & "$bin\llama-server.exe" --version
+
+      # Gaming PCs almost always have the VC++ redistributable, but "almost"
+      # is what the clean-node installer test exists to catch. Ship the CRT and
+      # OpenMP runtime beside the binaries, as a game bundles its redist.
+      - name: Bundle the MSVC runtime beside the binaries
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Redist\MSVC"
+          $ver = Get-ChildItem $root -Directory | Where-Object { $_.Name -match '^\d+\.' } |
+                 Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $ver) { Write-Warning "no MSVC redist directory under $root"; exit 0 }
+          foreach ($pattern in @('Microsoft.VC*.CRT', 'Microsoft.VC*.OpenMP')) {
+            $dir = Get-ChildItem "$($ver.FullName)\x64" -Directory | Where-Object { $_.Name -like $pattern } | Select-Object -First 1
+            if ($dir) { Copy-Item "$($dir.FullName)\*.dll" .\build\bin\Release\ -Verbose }
+            else { Write-Warning "no $pattern under $($ver.FullName)\x64" }
+          }
+
+      - name: Write BUILD-INFO.txt
+        shell: pwsh
+        run: |
+          $sha  = git rev-parse HEAD
+          $desc = git describe --tags --always
+          $pin  = "3750f9ce7ac20f7a905b43d9f20ad1050884f6c7"
+          @"
+          HCX llama.cpp fork -- Windows x64 CUDA build
+          commit:        $sha ($desc)
+          ref:           ${{ github.ref }}
+          upstream pin:  ggml-org/llama.cpp PR #23112 @ $pin (closed unmerged 2026-09-05)
+          CUDA toolkit:  ${{ matrix.cuda }}
+          CUDA archs:    $env:CUDA_ARCHS
+          compiler:      MSVC via vcvarsall x64, GitHub windows-2022 runner
+          built:         $(Get-Date -Format o)
+          workflow run:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Record the commit line beside every result produced with these binaries.
+          Two figures from two builds are not comparable, and nothing in the
+          output would tell you which you had.
+          "@ | Set-Content .\build\bin\Release\BUILD-INFO.txt
+          Get-Content .\build\bin\Release\BUILD-INFO.txt
+
+      - name: Pack binaries
+        shell: pwsh
+        run: |
+          $short = git rev-parse --short=9 HEAD
+          $name  = "llama-hcx-zaya1-$short-bin-win-cuda-${{ matrix.cuda }}-x64"
+          "ARTIFACT_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          7z a -snl "$name.zip" .\build\bin\Release\*
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.zip
+
+      # The node extracts this into the same folder as the binaries. Same step
+      # as upstream's release job, so the zip has the same name and contents.
+      - name: Copy and pack CUDA runtime
+        shell: pwsh
+        run: |
+          echo "CUDA install location: ${{ env.CUDA_PATH }}"
+          $dst = '.\build\bin\cudart\'
+          robocopy "${{ env.CUDA_PATH }}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{ env.CUDA_PATH }}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          Get-ChildItem $dst
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
+
+      - name: Upload CUDA runtime
+        uses: actions/upload-artifact@v6
+        with:
+          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64
+          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          Get-Content .\build\bin\Release\BUILD-INFO.txt | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
