@@ -334,8 +334,17 @@ llama_model_zaya::graph::graph(const llama_model & model, const llm_graph_params
             cb(qk_mean_k, "qk_mean_k", il);
 
             // conv state update
-            ggml_tensor * QKraw_t = ggml_cont(ctx0, ggml_transpose(ctx0, QKraw));
-            QKraw_t = ggml_reshape_3d(ctx0, QKraw_t, n_seq_tokens, n_qk, n_seqs);
+            //
+            // QKraw is [n_qk, n_tokens] with the ubatch's tokens ordered sequence-major.
+            // The conv path wants [n_seq_tokens, n_qk, n_seqs], i.e. a transpose done
+            // PER SEQUENCE. Transposing the whole [n_qk, n_tokens] block and then
+            // reshaping to 3-D is only equivalent when n_seqs == 1; for n_seqs > 1 it
+            // interleaves the sequences into the channel axis, and the scrambled
+            // tensor also feeds the recurrent conv-state write-back below. Every
+            // single-prompt test passed and every multi-slot server request produced
+            // token salad; this was the difference.
+            ggml_tensor * QKraw_3d = ggml_reshape_3d(ctx0, QKraw, n_qk, n_seq_tokens, n_seqs);
+            ggml_tensor * QKraw_t  = ggml_cont(ctx0, ggml_permute(ctx0, QKraw_3d, 1, 0, 2, 3));
 
             ggml_tensor * conv_input = ggml_concat(ctx0, conv_state, QKraw_t, 0);
             cb(conv_input, "cca_conv_input", il);

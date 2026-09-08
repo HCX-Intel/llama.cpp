@@ -761,7 +761,12 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_SSM_G_A,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_SSM_G_B,                    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     // ZAYA CCA
-    {LLM_TENSOR_CCA_CONV_GRP,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    // The op here is what the loader tests a weight against before choosing its
+    // buffer. cca_conv_grp is BF16 and is used as a conv kernel (cast, then
+    // im2col + mul_mat); the CUDA backend rejects a BF16 operand for MUL, so
+    // under the old tag all 40 of these weights were left in host memory and
+    // copied to the device on every graph compute (41 scheduler splits).
+    {LLM_TENSOR_CCA_CONV_GRP,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_IM2COL}},
     {LLM_TENSOR_CCA_K_SCALE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_CCA_VAL_PROJ1,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_CCA_VAL_PROJ2,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
