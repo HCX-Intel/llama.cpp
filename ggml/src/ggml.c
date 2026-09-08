@@ -4537,7 +4537,16 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
                 a_op);                                                                          // [OC, IC * K]
 
-    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    // result is [N*OL, OC] with the rows ordered (n, ol), ol fastest. For N == 1
+    // that is already [OL, OC, 1]. For N > 1 the batch axis sits between OL and
+    // OC, so reshape to [OL, N, OC] and move N to the end; the old direct
+    // reshape to [OL, OC, N] interleaved batch items into output channels.
+    if (im2col->ne[2] > 1) {
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]);  // [OL, N, OC]
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                 // [OL, OC, N]
+    } else {
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    }
 
     return result;
 }
