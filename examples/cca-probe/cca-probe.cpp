@@ -30,6 +30,7 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
     probe * p = (probe *) ud;
     if (ask) return p->n_seqs >= 2 && t->type == GGML_TYPE_F32;
     if (p->n_seqs < 2 || t->type != GGML_TYPE_F32) return true;
+    if (strstr(t->name, ".weight") || strstr(t->name, ".bias")) return true;   // a [1, n_head_kv] weight is not a sequence pair
     int d = -1; int64_t half = 0;
     for (int i = 3; i >= 0; --i) {
         if (t->ne[i] == (int64_t) p->n_seqs * p->n) { d = i; half = p->n; break; }
