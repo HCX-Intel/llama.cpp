@@ -34,6 +34,18 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  # HCX fork: upstream commented out every job below (see the TODO), which
+  # leaves a workflow file with no jobs. GitHub rejects such a file on every
+  # push as a "workflow file issue" and records a failed run, on every branch,
+  # before evaluating the branch filter. This placeholder keeps the file valid
+  # without running anything; the upstream job text is preserved untouched so
+  # rebases onto upstream stay clean. Not an HCX build: HCX builds CUDA on
+  # Windows in hcx-windows-cuda.yml.
+  cann-disabled-upstream:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: 'echo "CANN builds are disabled upstream; nothing to do in the HCX fork"'
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
 #  openEuler-latest-cann:
