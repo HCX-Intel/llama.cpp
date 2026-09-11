@@ -2,6 +2,10 @@ name: Python Type-Check
 
 on:
   push:
+    # HCX fork: this job needs upstream's self-hosted runners, which the fork
+    # does not have; every push to an hcx/** branch was cancelled or queued
+    # forever. Upstream's own triggers are kept for the master mirror.
+    branches-ignore: ['hcx/**', 'ci/**']
     paths:
       - '.github/workflows/python-type-check.yml'
       - 'ty.toml'
@@ -9,6 +13,7 @@ on:
       - '**/requirements*.txt'
       # - 'pyrightconfig.json'
   pull_request:
+    branches-ignore: ['hcx/**']
     paths:
       - '.github/workflows/python-type-check.yml'
       - 'ty.toml'
